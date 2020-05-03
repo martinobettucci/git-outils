@@ -1,0 +1,135 @@
+#!/bin/bash
+
+__stash_outils_setup(){
+	# Check si c'est un projet GIT
+	if [[ "$(git rev-parse --is-inside-work-tree)" == "true" ]]; then
+		# Sauvegarde ta session pour l'automatisation qui suit
+		git config --local credential.helper store
+		if [[ -s "$HOME/.git-credentials" ]]; then
+			## Setup is fine
+			git fetch --all
+			return 0;
+		else
+			echo "Veuillez enregistrer en cache vos crédentiels d'accès d'abord autrement les automations qui suivent vont échouer: faire un 'git push' par example ;-)"
+			return 2;
+		fi
+	else
+		echo "'$PWD' n'est pas un dossier GIT";
+		return 255;
+	fi
+}
+
+_push-stash(){ 
+## DEBUG
+if [[ -n "$1" ]]; then
+	set -x
+	trap 'set +x' RETURN
+	trap 'return 127' INT
+fi
+##DEBUG
+	# Check si tout est OK pour utiliser les utilitaires
+	__stash_outils_setup; __ret_setup=$?
+	if [[ $((__ret_setup)) -ne 0 ]]; then
+		return $__ret_setup
+	fi
+	# Check il y a des actions à faire
+	if [[ $(git stash list | wc -l) -eq 0 ]]; then
+			echo "Il n'y a pas de stash à envoyer";
+			return 1;
+	fi
+	# On commence par un warning à l'écran, quand même!!
+	echo "Cette action écrasera tout STASH existant sur le REMOTE avec la version existante depuis le LOCAL."
+	echo "Bref, ton stash REMOTE va être remplacé integralement par le stash sauvegardée LOCAL!!"
+	read -p "Appuyer sur entrée pour continuer ou CTRL+C pour annuler" confirm;
+	# Prepare les branches de stash pour l'origin
+	git send-pack --atomic . $(for sha in $(git rev-list -g stash); do echo $sha:refs/heads/stash_$sha; done) 2>&1 | tee >(
+		grep -oP 'stash_[0-9a-f]{40}' | while read pending_stash
+		do
+			git push --force origin $pending_stash
+		done
+	) 
+}
+
+_pull-stash(){ 
+## DEBUG
+if [[ -n "$1" ]]; then
+	set -x
+	trap 'set +x' RETURN
+	trap 'return 127' INT
+fi
+##DEBUG
+	# Check si tout est OK pour utiliser les utilitaires
+	__stash_outils_setup; __ret_setup=$?
+	if [[ $((__ret_setup)) -ne 0 ]]; then
+		return $__ret_setup
+	fi
+	# Check stash à récuperer
+	if [[ $(($(git ls-remote 2>/dev/null | grep -oP '[0-9a-f]{40}(.)+stash_[0-9a-f]{40}' | wc -l))) -eq 0 ]]; then
+		echo "Pas de stash dans le serveur à téléchager";
+		return 3;
+	fi
+	
+	# On commence par un warning à l'écran, quand même!!
+	echo "Cette action supprimera tout STASH existant sur le LOCAL qui aura été supprimé du REMOTE."
+	echo "Cette action écrasera tout STASH existant sur le LOCAL avec la version existante sur le REMOTE."
+	echo "Cette action SUPPRIMERA AUSSI TOUT STASH ET BRANCHE LOCALE N'AYANT PAS ETE ENVOYEE AU REMOTE."
+	echo "Bref, tout ce qui n'a pas été envoyée sera perdu et ton stash va être remplacé integralement par le stash sauvegardé dans le REMOTE!!"
+	read -p "Appuyer sur entrée pour continuer ou CTRL+C pour annuler" confirm;
+
+	# On va pas dire que l'on vous aura pas dit!!	
+	git stash clear
+
+	# Sauvegarde l'état actuel du repo avant le pull
+	git stash save -u "pull-stash" &>/dev/null
+	pull_stash_branch="$(git rev-parse --abbrev-ref HEAD)"
+
+	# Supprimera toute branche remote copiée en locale non existant sur l'origin!
+	git remote prune origin | tee >(
+		grep -oP 'stash_[0-9a-f]{40}' | while read pending_stash
+		do
+			git branch -D $pending_stash
+		done
+	)
+
+	# Télécharge les stash remote dans le stash local
+	for stash_log in "$(git ls-remote 2>/dev/null | grep -oP '[0-9a-f]{40}(.)+stash_[0-9a-f]{40}')"
+	do
+		stash_ref="origin/$(echo ${stash_log} | grep -oP 'stash_[0-9a-f]{40}')"
+		stash_msg="$(git log --format='%s' -1 ${stash_ref})"
+		stash_branch="$(echo $stash_msg | cut -d':' -f1 | cut -d' ' -f3-)"
+
+		stash_merge_log="$(git rev-list --parents -n 1 ${stash_ref})"
+		# Stash merge commit
+		stash_merge_0="$(echo $stash_merge_log | cut -d' ' -f1)"
+		# Stash CHECKOUT
+		stash_merge_C="$(echo $stash_merge_log | cut -d' ' -f2)"
+		# Stash index
+		stash_merge_I="$(echo $stash_merge_log | cut -d' ' -f3)"
+		# Stash untracked
+		stash_merge_U="$(echo $stash_merge_log | cut -d' ' -f4)"
+
+		# Recupère en local le stash sauvegardée
+		git checkout $stash_merge_C &> /dev/null
+		# Rebobine à l'état d'origine du stash
+		git cherry-pick -n $stash_merge_I
+		git format-patch -1 $stash_merge_U | while read patch_file
+		do
+			git apply $patch_file
+			rm $patch_file
+		done
+		# Regenère le stash 
+		git stash save -u "$stash_msg"
+
+		# Retour à à la ref. neutre
+		git checkout "$pull_stash_branch"
+	done
+
+	# Retour du dépôt à l'état précédent le stash-pull
+	git stash pop "pull-stash" &>/dev/null
+
+	# Affiche les stash recuperés
+	git stash list
+}
+
+alias push-stash="source ~/stash.outils; _push-stash"
+alias pull-stash="source ~/stash.outils; _pull-stash"
